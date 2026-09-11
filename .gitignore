@@ -1,0 +1,5 @@
+# Written next to the script by -Install, deleted by -Uninstall.
+*.launcher.vbs
+
+# Temporary files left behind only if a conversion is killed mid-write.
+~*.tmp
