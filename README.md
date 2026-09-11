@@ -1,5 +1,7 @@
 # Right Click XLSX2CSV2XLSX
 
+![Plugin Screenshot](https://github.com/guilamu/Right-Click-XLSX2CSV2XLSX/blob/main/screenshot.png)
+
 Two-way CSV and XLSX conversion from the Windows right-click menu.
 
 One PowerShell file, about 53 KB, and no dependencies: no Excel, no Python, no
