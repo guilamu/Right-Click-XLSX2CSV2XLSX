@@ -1,10 +1,8 @@
 # Right Click XLSX2CSV2XLSX
 
-![Plugin Screenshot](https://github.com/guilamu/Right-Click-XLSX2CSV2XLSX/blob/main/screenshot.png)
-
 Two-way CSV and XLSX conversion from the Windows right-click menu.
 
-One PowerShell file, about 53 KB, and no dependencies: no Excel, no Python, no
+One PowerShell file, about 62 KB, and no dependencies: no Excel, no Python, no
 Node, no PowerShell module. An XLSX file is only a ZIP archive of XML documents,
 so the script reads and writes the OpenXML package directly.
 
@@ -103,12 +101,15 @@ silently dropped.
 ### CSV to XLSX
 
 **Separator detection** counts `;`, `,`, tab and `|` outside quotes on the first
-non-empty line. The Excel `sep=;` convention on a leading line is honoured and
-that line is consumed.
+non-empty record, which spans several lines when a quoted field holds a line
+break. The Excel `sep=;` convention on a leading line is honoured and that line
+is consumed.
 
 **Encoding detection** looks for a UTF-8, UTF-16 LE or UTF-16 BE byte order mark.
 Without one, a sample is decoded as strict UTF-8; if that succeeds the file is
-treated as UTF-8, otherwise as the system ANSI code page.
+treated as UTF-8, otherwise as the system ANSI code page. PowerShell 7 reports
+UTF-8 as the default encoding, so there the ANSI code page of the current culture
+is used instead, and `ansi` means the same thing under both engines.
 
 **CSV parsing** is delegated to the .NET `TextFieldParser`, which handles quoted
 fields, doubled quotes, and separators or line breaks inside a field.
@@ -137,6 +138,16 @@ format codes are classified as date, time or both. Matching serial numbers are
 rendered with the short date pattern of the current locale. Excel counts a day
 that never existed, 29 February 1900, and that offset is reproduced, so output
 matches Excel cell for cell.
+
+**Elapsed time** formats such as `[h]:mm:ss`, `[mm]:ss` or `[s]` keep counting
+past a day, as Excel shows them: 1.5 days under `[h]:mm:ss` is written
+`36:00:00`, not `12:00:00`. Minutes and seconds formats give total minutes and
+total seconds.
+
+**Sheet width** comes from the `dimension` element when there is one. Some tools
+other than Excel write one that is too small. A cell found past it restarts the
+export with a width measured from every cell, so nothing is dropped and every
+record has the same number of fields.
 
 **Decimal separator** follows Excel's own behaviour under `auto`: a comma when the
 field separator is a semicolon and the locale uses a decimal comma, a dot
@@ -188,7 +199,8 @@ a second with all 44,229 cells identical.
 
 Writing produces a single sheet, named after the CSV file, with no formulas,
 conditional formatting or structured tables. Reading covers XLSX only; XLSB and
-XLS are binary formats and are rejected with a clear message.
+XLS are binary formats and are rejected with a message asking to save the file
+as XLSX first.
 
 A CSV line whose quotes are never closed swallows the following lines, which is
 inherent to the format.
@@ -197,11 +209,51 @@ The short date pattern follows the Windows locale in both directions. A CSV
 written as `MM/dd/yyyy` and read on a machine set to `dd/MM/yyyy` will be
 misread, so use `-AsText` or ISO dates in that case.
 
+## Tests
+
+`Tests\Invoke-ConversionTests.ps1` runs 46 end-to-end tests. Each one calls the
+script in a child process and checks the result with its own XLSX and CSV
+readers, not the script's, so a bug in one direction cannot hide the matching
+bug in the other. Input workbooks are built by hand, so Excel is not needed.
+
+The harness itself needs PowerShell 7. `-Engine` picks the engine that runs the
+converter, `powershell.exe` by default:
+
+```powershell
+pwsh -File .\Tests\Invoke-ConversionTests.ps1
+pwsh -File .\Tests\Invoke-ConversionTests.ps1 -Engine pwsh -Filter xlsx2csv
+```
+
+`-Keep` leaves the working folder in `%TEMP%` for inspection. The exit code is 1
+when any test fails.
+
 ## Changelog
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 `-Version` prints the version the script reports.
+
+### 1.0.1 - 2026-09-14
+
+#### Fixed
+
+- A workbook with exactly one distinct text value exported it as a single
+  character, `B` for `Bonjour`. PowerShell unrolled the one-item shared string
+  list on return. Excel stores all text as shared strings, so any Excel workbook
+  with a single text value was affected.
+- Elapsed-time formats such as `[h]:mm:ss` dropped whole days: 1.5 days came out
+  as `12:00:00` instead of `36:00:00`. `[m]` and `[s]` formats now give total
+  minutes and total seconds.
+- Cells past a `dimension` element that undercounts the sheet were dropped
+  without warning. The export now restarts with a width measured from the cells.
+- `.xls` and `.xlsb` files got the generic unsupported-type error instead of the
+  message asking to save them as XLSX.
+- Under PowerShell 7, `-Encoding ansi` and ANSI detection read and wrote UTF-8,
+  so accented characters in an ANSI CSV were lost.
+
+#### Added
+
+- End-to-end test suite, `Tests\Invoke-ConversionTests.ps1`.
 
 ### 1.0.0 - 2026-09-11
 
@@ -232,6 +284,7 @@ Initial release.
 ## Requirements
 
 Windows with PowerShell 5.1, which ships with Windows 10 and 11. Nothing else.
+The script also runs under PowerShell 7, but the right-click menu always uses 5.1.
 
 ## Licence
 

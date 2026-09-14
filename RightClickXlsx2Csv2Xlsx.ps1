@@ -153,7 +153,7 @@ $ErrorActionPreference = 'Stop'
 $ToolName = 'Right Click XLSX2CSV2XLSX'
 
 # Keep in step with the changelog in README.md.
-$ToolVersion = '1.0.0'
+$ToolVersion = '1.0.1'
 
 # ---------------------------------------------------------------------------
 # User-facing strings. Code and comments stay in English.
@@ -276,6 +276,14 @@ function ConvertTo-SafeFileName([string] $name) {
     return $name.Trim()
 }
 
+# The system ANSI code page. Windows PowerShell's Encoding.Default is that code
+# page, but on PowerShell 7 it is UTF-8, so there the culture supplies it.
+function Get-AnsiEncoding {
+    $fallback = [System.Text.Encoding]::Default
+    if ($PSVersionTable.PSEdition -ne 'Core') { return $fallback }
+    try { return [System.Text.Encoding]::GetEncoding($Cul.TextInfo.ANSICodePage) } catch { return $fallback }
+}
+
 # ===========================================================================
 #  CSV  ->  XLSX
 # ===========================================================================
@@ -309,7 +317,7 @@ function Resolve-CsvEncoding([string] $file, [string] $pref) {
     switch ($pref) {
         'utf8'    { return (New-Object System.Text.UTF8Encoding($false)) }
         'utf8bom' { return (New-Object System.Text.UTF8Encoding($true)) }
-        'ansi'    { return [System.Text.Encoding]::Default }
+        'ansi'    { return (Get-AnsiEncoding) }
         'unicode' { return [System.Text.Encoding]::Unicode }
     }
 
@@ -341,7 +349,7 @@ function Resolve-CsvEncoding([string] $file, [string] $pref) {
             [void] $strict.GetString($sample, 0, $end)
             return (New-Object System.Text.UTF8Encoding($false))
         } catch {
-            return [System.Text.Encoding]::Default
+            return (Get-AnsiEncoding)
         }
     } finally {
         $fs.Dispose()
@@ -719,10 +727,13 @@ function Select-Local($node, [string] $path) {
     return $node.SelectNodes($xp)
 }
 
+# The leading comma on each return keeps the list whole. PowerShell otherwise
+# unrolls it, and a workbook with a single shared string would hand back that
+# bare string, whose Count and indexer then work on its characters.
 function Read-SharedStrings($zip) {
     $list = New-Object 'System.Collections.Generic.List[string]'
     $e = Get-ZipEntry $zip 'xl/sharedStrings.xml'
-    if ($null -eq $e) { return $list }
+    if ($null -eq $e) { return , $list }
     $s = $e.Open()
     $xr = New-XmlReaderOn $s
     try {
@@ -740,27 +751,33 @@ function Read-SharedStrings($zip) {
             }
         }
     } finally { $xr.Dispose() }
-    return $list
+    return , $list
 }
 
-# Returns 0 = plain, 1 = date, 2 = time, 3 = date and time.
+# Returns 0 = plain, 1 = date, 2 = time, 3 = date and time. Elapsed time returns
+# the unit that keeps counting past its usual limit: 4 = hours [h],
+# 5 = minutes [m], 6 = seconds [s].
 function Get-FormatKind([string] $code) {
     if ([string]::IsNullOrEmpty($code)) { return 0 }
     $c = $code
     # An elapsed-time token such as [h] or [m] means time whatever else the code
     # holds. Recording that first keeps a bare [m], elapsed minutes, from being
     # read as a month by the fallback at the end of this function.
-    $elapsed = [regex]::IsMatch($c, '\[(h+|m+|s+)\]', 'IgnoreCase')
+    $elapsed = 0
+    if ([regex]::IsMatch($c, '\[h+\]', 'IgnoreCase')) { $elapsed = 4 }
+    elseif ([regex]::IsMatch($c, '\[m+\]', 'IgnoreCase')) { $elapsed = 5 }
+    elseif ([regex]::IsMatch($c, '\[s+\]', 'IgnoreCase')) { $elapsed = 6 }
     $c = [regex]::Replace($c, '\[(h+|m+|s+)\]', '$1', 'IgnoreCase')
     $c = [regex]::Replace($c, '\[[^\]]*\]', '')
     $c = [regex]::Replace($c, '"[^"]*"', '')
     $c = [regex]::Replace($c, '\\.', '')
     $c = $c.ToLowerInvariant()
     $hasDate = ($c.IndexOf('y') -ge 0) -or ($c.IndexOf('d') -ge 0)
-    $hasTime = $elapsed -or ($c.IndexOf('h') -ge 0) -or ($c.IndexOf('s') -ge 0)
+    $hasTime = ($elapsed -ne 0) -or ($c.IndexOf('h') -ge 0) -or ($c.IndexOf('s') -ge 0)
     if ((-not $hasDate) -and (-not $hasTime) -and $c.IndexOf('m') -ge 0) { $hasDate = $true }
     if ($hasDate -and $hasTime) { return 3 }
     if ($hasDate) { return 1 }
+    if ($elapsed -ne 0) { return $elapsed }
     if ($hasTime) { return 2 }
     return 0
 }
@@ -775,11 +792,12 @@ function Get-BuiltinFormatKind([int] $id) {
     return 0
 }
 
-# Maps each cell style index to a format kind.
+# Maps each cell style index to a format kind. The list is returned whole, for
+# the reason given above Read-SharedStrings.
 function Read-StyleKinds($zip) {
     $kinds = New-Object 'System.Collections.Generic.List[int]'
     $doc = Read-ZipXmlDocument $zip 'xl/styles.xml'
-    if ($null -eq $doc) { return $kinds }
+    if ($null -eq $doc) { return , $kinds }
 
     $custom = @{}
     foreach ($n in (Select-Local $doc 'styleSheet/numFmts/numFmt')) {
@@ -793,7 +811,7 @@ function Read-StyleKinds($zip) {
         if ($custom.ContainsKey($id)) { $kinds.Add($custom[$id]) }
         else { $kinds.Add((Get-BuiltinFormatKind $id)) }
     }
-    return $kinds
+    return , $kinds
 }
 
 function Get-WorkbookSheets($zip) {
@@ -829,6 +847,19 @@ function Get-WorkbookSheets($zip) {
 }
 
 function Format-SerialDate([double] $serial, [int] $kind, [bool] $d1904) {
+    if ($kind -ge 4) {
+        # Elapsed time: the leading unit counts past 24 hours or 60 minutes, so
+        # whole days must be kept, unlike a time of day.
+        $sign = ''
+        if ($serial -lt 0) { $sign = '-' }
+        $total = [long] [Math]::Floor([Math]::Round([Math]::Abs($serial) * 86400000) / 1000)
+        $sec = ($total % 60).ToString('00', $Inv)
+        if ($kind -eq 6) { return $sign + $total.ToString($Inv) }
+        $minutes = [long] [Math]::Floor($total / 60)
+        if ($kind -eq 5) { return $sign + $minutes.ToString('00', $Inv) + ':' + $sec }
+        $hours = [long] [Math]::Floor($total / 3600)
+        return $sign + $hours.ToString('00', $Inv) + ':' + ($minutes % 60).ToString('00', $Inv) + ':' + $sec
+    }
     if ($kind -eq 2) {
         $frac = $serial - [Math]::Floor($serial)
         return ([timespan]::FromDays($frac)).ToString('hh\:mm\:ss', $Inv)
@@ -845,7 +876,7 @@ function Format-SerialDate([double] $serial, [int] $kind, [bool] $d1904) {
     return $dt.ToString($Cul.DateTimeFormat.ShortDatePattern, $Cul)
 }
 
-function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $styleKinds, [bool] $d1904) {
+function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $styleKinds, [bool] $d1904, [bool] $ignoreDimension = $false) {
 
     $entry = Get-ZipEntry $zip $target
     if ($null -eq $entry) { throw ($L.NoSheet -f $target) }
@@ -862,8 +893,10 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
     if ($EffectiveLanguage -eq 'fr') { $boolTrue = 'VRAI'; $boolFalse = 'FAUX' }
 
     # --- Pass 1: how wide is the sheet -------------------------------------
-    # The dimension element is authoritative when present and sane; otherwise
-    # every cell reference is scanned.
+    # The dimension element is trusted when present and sane, unless a cell past
+    # it has already sent the export back here. Otherwise every cell is scanned,
+    # and a cell without a reference takes the column after the previous one,
+    # as in pass 2.
     $maxCol = 0
     $s1 = $entry.Open()
     $xr = New-XmlReaderOn $s1
@@ -872,7 +905,7 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
             if ($xr.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
             if ($xr.LocalName -eq 'dimension') {
                 $ref = $xr.GetAttribute('ref')
-                if ($ref) {
+                if ($ref -and -not $ignoreDimension) {
                     $last = $ref.Split(':')[-1]
                     $ci = Get-ColumnIndex $last
                     if ($ci -gt 0 -and $ci -le 16384) { $maxCol = $ci; break }
@@ -882,13 +915,17 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
             }
         }
         if ($maxCol -eq 0) {
+            $lastCol = 0
             while ($xr.Read()) {
-                if ($xr.NodeType -eq [System.Xml.XmlNodeType]::Element -and $xr.LocalName -eq 'c') {
+                if ($xr.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                if ($xr.LocalName -eq 'row') { $lastCol = 0 }
+                elseif ($xr.LocalName -eq 'c') {
+                    $ci = 0
                     $r = $xr.GetAttribute('r')
-                    if ($r) {
-                        $ci = Get-ColumnIndex $r
-                        if ($ci -gt $maxCol) { $maxCol = $ci }
-                    }
+                    if ($r) { $ci = Get-ColumnIndex $r }
+                    if ($ci -eq 0) { $ci = $lastCol + 1 }
+                    $lastCol = $ci
+                    if ($ci -gt $maxCol) { $maxCol = $ci }
                 }
             }
         }
@@ -900,7 +937,7 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
     $encObj = switch ($encPref) {
         'utf8bom' { New-Object System.Text.UTF8Encoding($true) }
         'utf8'    { New-Object System.Text.UTF8Encoding($false) }
-        'ansi'    { [System.Text.Encoding]::Default }
+        'ansi'    { Get-AnsiEncoding }
         'unicode' { New-Object System.Text.UnicodeEncoding($false, $true) }
     }
 
@@ -909,6 +946,7 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
     $sharedCount = $shared.Count
     $kindCount = $styleKinds.Count
     $rowsOut = 0
+    $overflow = $false
 
     $sw = New-Object System.IO.StreamWriter($tmp, $false, $encObj, 65536)
     try {
@@ -921,7 +959,7 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
             $expected = 1
             $advance = $true
 
-            while ($true) {
+            :rows while ($true) {
                 if ($advance) { if (-not $xr.Read()) { break } } else { $advance = $true }
                 if ($xr.NodeType -ne [System.Xml.XmlNodeType]::Element -or $xr.LocalName -ne 'row') { continue }
 
@@ -958,7 +996,13 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
                     }
                     if ($col -eq 0) { $col = $lastCol + 1 }
                     $lastCol = $col
-                    if ($col -gt $cells.Length) { continue }
+                    if ($col -gt $cells.Length) {
+                        # The dimension element undercounted the columns. Start
+                        # over with a measured width rather than drop the cell,
+                        # so every record keeps the same number of fields.
+                        if (-not $ignoreDimension) { $overflow = $true; break rows }
+                        continue
+                    }
 
                     $type = ''
                     $ai = $attrs.IndexOf('t="')
@@ -1059,6 +1103,10 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
         $sw.Dispose()
     }
 
+    if ($overflow) {
+        return Export-Sheet $zip $target $destination $shared $styleKinds $d1904 $true
+    }
+
     if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }
     [System.IO.File]::Move($tmp, $destination)
 
@@ -1072,8 +1120,6 @@ function Export-Sheet($zip, [string] $target, [string] $destination, $shared, $s
 }
 
 function Convert-XlsxToCsv([string] $source) {
-    if ($source -match '\.(xlsb|xls)$') { throw $L.Xlsb }
-
     $zip = [System.IO.Compression.ZipFile]::OpenRead($source)
     try {
         $wb = Get-WorkbookSheets $zip
@@ -1368,6 +1414,9 @@ foreach ($src in $targets) {
             $res = Convert-CsvToXlsx $full $dest
             $results += $res
             if ($Open) { Start-Process -FilePath $res.Output }
+        } elseif ($ext -eq '.xls' -or $ext -eq '.xlsb') {
+            # Named apart so the message says what to do, not only what was expected.
+            throw $L.Xlsb
         } else {
             throw ($L.Unknown -f $ext, ($ReadableCsv -join ', '), ($ReadableXlsx -join ', '))
         }
